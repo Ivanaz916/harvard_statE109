@@ -1,0 +1,658 @@
+---
+title: "Final Project: Rental Listing Duration in Boston-Perimeter Towns (Cambridge, Somerville, Arlington)"
+author: "Ivana Rocci"
+date: "2024-05-03"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(geosphere)
+library(purrr)
+library(lubridate)
+library(PerformanceAnalytics)
+library(MASS)
+library(ggplot2)
+library(gridExtra)
+library(caret)
+library(randomForest)
+library(lime)
+```
+
+
+```{r}
+
+all_rentcast_data <- list()
+
+for(i in c(1,2,4,5,6,7,8,9)){
+  temp <- read.csv(paste0('C:/Users/ivana/Google Drive (ivana.rocci131@gmail.com)/Harvard_2024/Project/data_file',i,'.csv'))
+  temp2 <- read.csv(paste0('C:/Users/ivana/Google Drive (ivana.rocci131@gmail.com)/Harvard_2024/Project/rentcast_updated_more_history/data_file_history',i,'.csv'))
+  
+  temp_both <- bind_rows(temp,temp2)
+  
+  all_rentcast_data[[i]] <- temp_both
+  
+}
+
+df <- bind_rows(all_rentcast_data)
+
+#Add back in leading zeros since got removed  in file conversion process (from API to csv)
+df$zipCode <- paste0(0,df$zipCode)
+
+#Convert character date fields to proper date type
+df <- df %>%
+     mutate_at(vars(ends_with("Date")), as.Date)
+
+
+#Add year only col
+df$listedYear <- year(df$listedDate)
+
+#Add Quarter col
+df$listedQuarter <- quarter(df$listedDate)
+
+#Add Quarter_Year col
+df$quarter_year <- paste0('Q',df$listedQuarter,' ',df$listedYear)
+
+
+
+
+#Calc distance to all nearby mbta stops
+
+Alewife_latitude <- 42.3964
+Alewife_longitude <-   -71.142 
+Davis_latitude <-42.396        
+Davis_longitude <- -71.1225
+Porter_latitude <- 42.38864
+Porter_longitude <- -71.1194
+Harvard_latitude <-42.37352
+Harvard_longitude <--71.1189
+Central_latitude <- 42.36541
+Central_longitude <- -71.1036
+Kendall_MIT_latitude <- 42.36849              
+Kendall_MIT_longitude <- -71.0902
+
+
+#for each row, calculate distance to mbta stop in meters
+df$dist_to_alewife <- map2_dbl(df$longitude, df$latitude, 
+                               ~distm(c(.x, .y), c(Alewife_longitude, Alewife_latitude)))
+  
+df$dist_to_davis <- map2_dbl(df$longitude, df$latitude, 
+                               ~distm(c(.x, .y), c(Davis_longitude, Davis_latitude)))
+
+df$dist_to_porter <- map2_dbl(df$longitude, df$latitude, 
+                               ~distm(c(.x, .y), c(Porter_longitude, Porter_latitude)))
+
+df$dist_to_harvard <- map2_dbl(df$longitude, df$latitude, 
+                               ~distm(c(.x, .y), c(Harvard_longitude, Harvard_latitude)))
+
+df$dist_to_central <- map2_dbl(df$longitude, df$latitude, 
+                               ~distm(c(.x, .y), c(Central_longitude, Central_latitude)))
+
+df$dist_to_Kendall_MIT <- map2_dbl(df$longitude, df$latitude, 
+                               ~distm(c(.x, .y), c(Kendall_MIT_longitude, Kendall_MIT_latitude)))
+
+df$closest_t_stop_dist <- pmin(df$dist_to_alewife, df$dist_to_davis, df$dist_to_porter, df$dist_to_harvard, df$dist_to_central,  df$dist_to_Kendall_MIT)
+
+
+
+#Bring in FM FRM data from Q1 2020 - Q4 2023
+#Source: https://www.freddiemac.com/pmms
+mortgage_rates <- read.csv('C:/Users/ivana/Google Drive (ivana.rocci131@gmail.com)/Harvard_2024/Project/freddie_mac_AVG_historicalweeklydata.csv')
+
+df <- left_join(df, mortgage_rates, by = 'quarter_year')
+
+
+```
+
+4. Exploratory Data Analysis - Tabular Analysis of Data (Phase 1)
+
+a)How many incomplete cases?
+b) How many duplicates?
+c) What is min/max of dates?
+d) How balanced is dataset in terms of dates? towns?
+e) Could I find my own listings?
+f) How many repeat listings?
+g) How many large complexes?
+h) distribution of values by variable
+i) reasonability params
+j) boxplot of days on market
+
+
+
+
+```{r}
+#a
+#Find all the complete cases
+complete_rows <- df[complete.cases(df), ] #391 of 7364
+
+# Count the number of NA values in each column
+na_count <- df %>%
+  summarise_all(function(x) sum(is.na(x))) #remove lotsize and yearBuilt
+
+#b
+# first create a key which combines id and listedDate since id itself is not a unique key because an apt id could be listed twice over a timespan period
+df$unique_key <- paste0(df$id,'_',df$listedDate)
+dup_ids <- df %>% group_by(unique_key) %>% summarise(count = n()) #809 true dups
+df <- df %>% distinct(unique_key, .keep_all = TRUE) #df goes from 7364 to 6555 
+#c
+min(df$listedDate)
+max(df$listedDate)
+
+#d
+# ? does balanced-ness of classes only relate to dependent variable and when its a factor?
+#Or could we talk about a dataset being balanced/imbalanced in regards to the independent vars?
+
+dates_cities_summary <- df %>% group_by(listedYear , city) %>% summarise(count = n())
+
+
+#e
+#No, some neighbors listings are there but not my own
+
+#f
+repeats <- df %>% group_by(id) %>% summarize(repeat_listings = n()) #909 (each had 2 listings)
+
+#g -- add this is a feature
+large_complex_check <- df %>% group_by(addressLine1) %>% summarize(no_units = n()) #largest has 106 units!
+large_complex_check <- large_complex_check %>% filter(no_units >= 10)
+large_complex_check$large_building_complex <- TRUE
+df <- left_join(df, large_complex_check[,c('addressLine1','large_building_complex')], by = 'addressLine1')
+df$large_building_complex <- ifelse(is.na(df$large_building_complex),'FALSE',df$large_building_complex)
+
+
+
+#g1
+median_prices_and_sd <- df %>% group_by(quarter_year, bedrooms) %>% summarise(med_price = median(price, na.rm=T), sd = sd(price, na.rm=T))
+df <- left_join(df, median_prices_and_sd, by = c('quarter_year', 'bedrooms'))
+df$price_z_score <- (df$price - df$med_price )/df$sd
+
+#h distribution of values by variable (to identify problem with seemingly false squarefootage vals (eg >= 9999)))
+par(mfrow = c(2,4))
+hist(df$bedrooms)
+hist(df$bathrooms)
+hist(df$squareFootage)
+hist(df$price)
+hist(df$closest_t_stop_dist)
+hist(df$AVG_FRM_30Y)
+hist(df$daysOnMarket)
+hist(df$price_z_score)
+
+#Looks like some outliers for squareFootage and closest_t_stop_dist.  Could consider winsorization, z score filters, IQR method or cooke's distance to remove outliers.  Lets review these closely when looking at Cooke's distance
+
+#i Set reasonability params
+df_clean <- df %>% filter(squareFootage < 9000)
+df_clean <- df_clean %>% filter(closest_t_stop_dist < 40000) # (meters, approx 20 miles)
+
+#j
+        qqnorm(df_clean$daysOnMarket)
+        qqline(df_clean$daysOnMarket)
+        boxplot(df_clean$daysOnMarket)
+
+
+
+#k Set reasonability params
+df_clean <- df_clean %>% filter(daysOnMarket < 365)
+
+```
+
+5. Exploratory Data Analysis - Visualizations (Phase 2)
+
+In phase 2 of Exploratory Data Analysis, I will fit a model with all the variables which have 100% completeness.  (??IZ: Do I need 100% completeness?). 
+Additionally, all factor variables will be converted to factor type in R.
+From there I can run a pairs panel to understand multivariate comparisons as well as run diagnostic plots to assess if Linear Regression Model- Assumptions can be met.
+
+```{r}
+
+df_clean <- df_clean %>%
+  mutate(across(c(city, propertyType, status, listedQuarter, large_building_complex), as.factor))
+
+
+df_clean <- df_clean %>% select(c('city', 'propertyType','bedrooms', 'bathrooms','squareFootage', 'price','daysOnMarket','closest_t_stop_dist','listedQuarter','AVG_FRM_30Y', 'large_building_complex', 'price_z_score'))
+
+
+df_complete <- df[complete.cases(df), ]
+#df_complete <- df_complete %>% filter(bedrooms != 0) #Needed bc when do a log transform, R does not like values that are = 0
+
+set.seed(222)
+ind <- sample(2, nrow(df_complete), replace = T, prob = c(0.8, 0.2))
+train_80 <- df_complete[ind == 1,]
+test_20 <- df_complete[ind == 2,]
+
+
+base.model <- lm(daysOnMarket ~ ., data = train_80)
+summary(base.model)
+# TO DO: Add RMSE in model evaluation
+p <- predict(base.model, train_80) 
+plot(train_80$daysOnMarket,p)
+#calc RMSE (matches slide for train)
+sqrt(mean((train_80$daysOnMarket-p)^2))
+#Rsquared
+(cor(train_80$daysOnMarket,p))^2
+
+
+#Days on Market looks to be right-skewed. 
+chart.Correlation(train_80[,c('bedrooms', 'bathrooms','squareFootage',  'price','closest_t_stop_dist','AVG_FRM_30Y','daysOnMarket')]) 
+
+# Does the model satisfy the assumptions of MLR?
+par(mfrow = c(4,2))
+plot(base.model, which = 1)
+plot(base.model, which = 2)
+plot(base.model, which = 3)
+plot(base.model, which = 4)
+plot(base.model, which = 5)
+plot(base.model, which = 6)
+#par(mfrow = c(2,2))
+#plot(base.model)
+```
+a) Linearity/Independence (Residuals v Fitted)
+The plot of Residuals vs Fitted values looks for heteroscedasticity and it shows that the data points are initially clustered above the red line, then become more evenly clustered, and finally, start to cluster above the line again.
+With that, it violates the assumption because it does NOT show random pattern.
+Action ==> consider applying a non-linear transformation to the independent and dependent variables
+
+b) Normality (Normal Q-Q Plot)
+The standardized residuals fits the qqline generally. However, there are several outliers <-2
+ and > 2. We can conclude that the residuals do NOT show a normal distribution.
+ Action <- 
+ 
+c) Equality of Variance (Scale-Location Plot)
+The standardized residuals shows that they are creating an upward sloping trend rather than being equally and randomly distributed.
+Hence, the graph does NOT show that it satisfies the assumption of equality of variance.
+
+d) High leverage points (Residuals vs Leverage)
+The graph shows that there are no residuals near or outside the Cook's distance (0.5 or 1). This is positive to see there are no outliers or high leverage points that are potentially over-influencing the linear model.
+
+CHECK FOR MULTICOLLINEARITY
+```{r,eval=TRUE}
+ vif(base.model)
+```
+Multicollinarity is not present since all the variables have a VIF < 10
+
+
+OUTLIER and HIGH LEVERAGE HANDLING
+```{r,eval=TRUE}
+train_80 <- train_80[!rownames(train_80) %in% c(2611,3683), ]
+```
+
+
+
+
+
+
+TRANSFORMS ON MODEL SO MEETS REQUIREMENTS OF MLR 
+
+Box-Cox transformation check
+```r
+par(mfrow = c(1,1))
+bc <- boxcox(base.model, data = train_80)
+
+```
+The peak of the plot is close to lambda = zero, then can try doing log transform.  Reviewing the pairs panels from earlier, it seems most of the variables have a skewed distribution (majority right, but some left like AVG_FRM_30Y), so will try running a log transformation on all variables.  First need to trim df for only complete cases since R complains about NA values when trying to do a log transformation
+
+
+```{r}
+
+#train_80$log_daysOnMarket <- log(train_80$daysOnMarket)
+#train_80$log_bedrooms <- log(train_80$bedrooms)
+#train_80$log_bathrooms <- log(train_80$bathrooms)
+train_80$log_squareFootage <- log(train_80$squareFootage)
+train_80$log_price <- log(train_80$price)
+#train_80$log_closest_t_stop_dist <- log(train_80$closest_t_stop_dist)
+#train_80$log_AVG_FRM_30Y <- log(train_80$AVG_FRM_30Y)
+
+
+base.model_2 <- lm(daysOnMarket ~ city +  propertyType + bedrooms + bathrooms + log_squareFootage + status + log_price + closest_t_stop_dist + listedQuarter +  AVG_FRM_30Y + large_building_complex, data = train_80)
+summary(base.model_2)
+
+chart.Correlation(train_80[,c('bedrooms', 'bathrooms','log_squareFootage',  'log_price','closest_t_stop_dist','AVG_FRM_30Y','daysOnMarket')]) 
+
+#Try with fewer independent vars.  Remove the independent vars which are highly correlated with price (bedrooms and bathrooms)
+chart.Correlation(train_80[,c('squareFootage',  'price','closest_t_stop_dist','AVG_FRM_30Y','log_daysOnMarket')]) 
+
+
+# Does the model satisfy the assumptions of MLR?
+par(mfrow = c(2,2))
+plot(base.model_2)
+
+```
+
+
+train_80$price_per_squareFootage <- train_80$price / train_80$squareFootage
+
+
+
+CHECK FOR INTERACTION
+
+```{r}
+
+#Row 1
+row1_1 <- ggplot(train_80 ) +
+    aes(x = bedrooms, y = daysOnMarket, color = city) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+row1_2 <- ggplot(train_80 ) +
+    aes(x = bathrooms, y = daysOnMarket, color = city) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+
+row1_3 <- ggplot(train_80 ) +
+    aes(x = squareFootage, y = daysOnMarket, color = city) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+row1_4 <-ggplot(train_80 ) +
+    aes(x = price, y = daysOnMarket, color = city) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+row1_5 <-ggplot(train_80 ) +
+    aes(x = closest_t_stop_dist, y = daysOnMarket, color = city) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+
+row1_6 <-ggplot(train_80 ) +
+    aes(x = AVG_FRM_30Y, y = daysOnMarket, color = city) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+
+
+#Row 2
+row2_1 <- ggplot(train_80 ) +
+    aes(x = bedrooms, y = daysOnMarket, color = propertyType) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+row2_2 <- ggplot(train_80 ) +
+    aes(x = bathrooms, y = daysOnMarket, color = propertyType) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+
+row2_3 <-ggplot(train_80 ) +
+    aes(x = squareFootage, y = daysOnMarket, color = propertyType) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+row2_4 <-ggplot(train_80 ) +
+    aes(x = price, y = daysOnMarket, color = propertyType) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+row2_5 <-ggplot(train_80 ) +
+    aes(x = closest_t_stop_dist, y = daysOnMarket, color = propertyType) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+
+row2_6 <-ggplot(train_80 ) +
+    aes(x = AVG_FRM_30Y, y = daysOnMarket, color = propertyType) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+
+
+#Row 3
+row3_1 <- ggplot(train_80 ) +
+    aes(x = bedrooms, y = daysOnMarket, color = listedQuarter) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+row3_2 <-ggplot(train_80 ) +
+    aes(x = bathrooms, y = daysOnMarket, color = listedQuarter) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+
+row3_3 <-ggplot(train_80 ) +
+    aes(x = squareFootage, y = daysOnMarket, color = listedQuarter) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+row3_4 <-ggplot(train_80 ) +
+    aes(x = price, y = daysOnMarket, color = listedQuarter) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+row3_5 <-ggplot(train_80 ) +
+    aes(x = closest_t_stop_dist, y = daysOnMarket, color = listedQuarter) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+
+row3_6 <-ggplot(train_80 ) +
+    aes(x = AVG_FRM_30Y, y = daysOnMarket, color = listedQuarter) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+
+#Row 4
+row4_1 <- ggplot(train_80 ) +
+    aes(x = bedrooms, y = daysOnMarket, color = large_building_complex) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+row4_2 <-ggplot(train_80 ) +
+    aes(x = bathrooms, y = daysOnMarket, color = large_building_complex) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+
+row4_3 <-ggplot(train_80 ) +
+    aes(x = squareFootage, y = daysOnMarket, color = large_building_complex) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+row4_4 <-ggplot(train_80 ) +
+    aes(x = price, y = daysOnMarket, color = large_building_complex) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+row4_5 <-ggplot(train_80 ) +
+    aes(x = closest_t_stop_dist, y = daysOnMarket, color = large_building_complex) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+
+row4_6 <-ggplot(train_80 ) +
+    aes(x = AVG_FRM_30Y, y = daysOnMarket, color = large_building_complex) +
+    geom_point(color = "grey") +
+    geom_smooth(method = "lm")
+
+grid.arrange(row1_1, row1_2, row1_3, row1_4, row1_5, row1_6, 
+             row2_1, row2_2, row2_3, row2_4, row2_5, row2_6,
+             row3_1, row3_2, row3_3, row3_4, row3_5, row3_6,
+             row4_1, row4_2, row4_3, row4_4, row4_5, row4_6,
+             nrow = 4, ncol = 6)
+```
+
+```{r}
+base.model_4 <- lm(daysOnMarket ~ city +  propertyType + log_squareFootage + status + log_price +  listedQuarter +  AVG_FRM_30Y + large_building_complex + price_per_squareFootage + log_squareFootage*propertyType +  log_price*propertyType + listedQuarter*log_squareFootage + listedQuarter*log_price, data = train_80)
+summary(base.model_4)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Now that we are more comfortable with the diagnostic checks, Lets reduce the model to find the most important variables.
+
+```{r}
+
+#Use the stepAIC function to get the optimal model.
+optimal.model <- stepAIC(base.model, direction="forward")
+summary(optimal.model)
+
+ 
+chart.Correlation(df[,c('bedrooms', 'bathrooms','squareFootage',  'price','closest_t_stop_dist','AVG_FRM_30Y','daysOnMarket')]) 
+
+# Does the model satisfy the assumptions of MLR?
+par(mfrow = c(2,2))
+plot(m)
+```
+
+
+Try as non-parametric method:
+
+```{r}
+
+
+
+
+# regression tree
+tree <- rpart(daysOnMarket ~ ., data = train_80)
+rpart.plot(tree)
+printcp(tree)
+plotcp(tree)
+
+# Predict 
+p <- predict(tree, test_20)
+plot(p ~ test_20$daysOnMarket)
+#calc RMSE (matches slide for train)
+sqrt(mean((test_20$daysOnMarket-p)^2))
+#Rsquared
+(cor(test_20$daysOnMarket,p))^2
+
+# Bagging
+# cvcontrol is a list that specifies the settings for 2-times repeated 5-fold cross-validation with parallel computation.
+set.seed(1234)
+cvcontrol <- trainControl(method="repeatedcv", 
+                          number = 5,
+                          repeats = 2,
+                          allowParallel=TRUE)
+#method = "repeatedcv": This sets the resampling method to repeated k-fold cross-validation.
+#k value is 5, as specified by number = 5. This means that in each repetition of the cross-validation process, your data is split into 5 subsets (folds). The model is trained on 4 of these subsets and tested on the remaining subset
+#repeats = 2: This sets the number of repetitions in the repeated k-fold cross-validation to 2. That is, the whole process of 5-fold cross-validation is repeated 2 times.
+#allowParallel = TRUE: This allows the resampling process to be done in parallel, if possible. This can speed up the computation time, especially for large datasets and complex models. The actual parallel computation is done by the foreach package, and you need to register a parallel backend, such as doParallel or doMC, before training the model.
+
+set.seed(1234)
+model_bag <- train(daysOnMarket  ~  ., 
+             data=train_80,
+             method="treebag",##BAGGING METHOD
+             trControl=cvcontrol,
+             importance=TRUE) ##VAR IMPORTANCE INCLUDE
+plot(varImp(model_bag))
+
+# Plot, RMSE, R-square
+ba <- predict(model_bag,  test_20)
+plot(ba ~ test_20$daysOnMarket, main = 'Predicted Vs Actual DaysonMarket - Test data')
+sqrt(mean((test_20$daysOnMarket - ba)^2)) #RSME
+cor(test_20$daysOnMarket, ba) ^2  #R-squared
+
+
+
+# RF
+set.seed(1234)
+cvcontrol <- trainControl(method="repeatedcv", 
+                          number = 5,
+                          repeats = 2,
+                          allowParallel=TRUE)
+
+
+forest <- train(daysOnMarket  ~  ., 
+             data=train_80,
+             method="rf",  #ONLY DIFF
+             trControl=cvcontrol,
+             importance=TRUE)
+#plot(varImp(forest))
+
+# Plot, RMSE, R-square
+rf <-  predict(forest,  test_20)
+plot(rf ~ test_20$daysOnMarket, main = 'Predicted Vs Actual DaysonMarket - Test data')
+sqrt(mean((test_20$daysOnMarket - rf)^2))
+cor(test_20$daysOnMarket, rf) ^2
+
+
+# Extract the RMSE values and the corresponding numbers of predictors
+# PROF RAI:  How is it even coming up with a mtry = 18?? Because I only have 12 predictor vars
+results <- forest$results[, c("mtry", "RMSE")]
+
+# Plot RMSE versus number of predictors
+ggplot(results, aes(x = mtry, y = RMSE)) +
+  geom_point() +
+  geom_line() +
+  labs(x = "Number of Predictors", y = "RMSE")+
+  ggtitle("RMSE vs Number of Predictors in Random Forest")
+
+
+
+### Visualize variable importance ----------------------------------------------
+# https://hackernoon.com/random-forest-regression-in-r-code-and-interpretation
+# Get variable importance from the model fit
+# Assume `model` is your Random Forest model trained with caret
+rf_final_model <- forest$finalModel
+
+# Get variable importance
+importance_df <- as.data.frame(randomForest::importance(rf_final_model))
+var_names <- row.names(importance_df)
+importance_df$var_names <- var_names
+
+# Reorder the factor levels of var_names in descending order of %IncMSE
+importance_df$var_names <- reorder(importance_df$var_names, importance_df$`%IncMSE`)
+
+ggplot(importance_df, aes(x=var_names, y=`%IncMSE`)) +
+  geom_segment( aes(x=var_names, xend=var_names, y=0, yend=`%IncMSE`), color="skyblue") +
+  geom_point(aes(size = IncNodePurity), color="blue", alpha=0.6) +
+  theme_light() +
+  coord_flip() +
+  xlab("") +  # Remove y-axis label
+  theme(
+    legend.position="bottom",
+    panel.grid.major.y = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+#MSE is based on permuting out-of-bag sections of the data per individual tree and predictor, and the errors are then averaged. 
+#In the regression context, Node purity is the total decrease in residual sum of squares when splitting on a variable averaged over all trees (i.e. how well a predictor decreases variance). 
+#MSE is a more reliable measure of variable importance. If the two importance metrics show different results, listen to MSE
+
+
+# Explain predictions for first 3 rows in test data
+# 
+
+explainer <- lime(test_20[1:3,], forest, n_bins = 5)
+explanation <- explain( x = test_20[1:3,], 
+                       explainer = explainer, 
+                       n_features = 5) # n features allows you to see top 5 features
+plot_features(explanation)
+
+```
+
+```{r}
+# RF ALT
+#when running train() using caret package how do experiment with number of trees (ntree) or the number of variables tried at each split (mtry)?
+# Assume `df` is your data frame and `outcome` is your outcome variable
+# Set up the control function for training
+set.seed(1234)
+cvcontrol <- trainControl(method="repeatedcv", 
+                          number = 5,
+                          repeats = 2,
+                          allowParallel=TRUE)
+
+# Define the tuning grid
+tune_grid <- expand.grid(.mtry = c(1, 2, 3), .ntree = c(100, 200, 300))
+
+# Train the model with different values of mtry and ntree
+forest <- train(daysOnMarket  ~  ., 
+             data=train_80,
+             method="rf",  #ONLY DIFF
+             trControl=cvcontrol,
+             tuneGrid = tune_grid,
+             importance=TRUE)
+
+
+
+
+

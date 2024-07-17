@@ -1,0 +1,567 @@
+---
+title: "Final Project: Rental Listing Duration in Boston-Perimeter Towns (Cambridge,
+  Somerville, Arlington)"
+author: "Ivana Rocci"
+date: "2024-05-03"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(geosphere)
+library(purrr)
+library(lubridate)
+library(PerformanceAnalytics)
+library(MASS)
+library(car)
+library(ggplot2)
+library(gridExtra)
+library(caret)
+library(randomForest)
+library(lime)
+library(rpart)
+library(rpart.plot)
+library(psych)
+```
+
+1. Research Question and Motivation
+
+The motivation of this applied research paper is to discover which features might impact the length of days a rental property in the Arlington, Somerville or Cambridge neighborhoods is listed for.  My husband and I are multi-family building owners in Arlington and Somerville, so this research could greatly assist with one of the key burdens of property management which is re-listing a unit once a tenant has left.  Being at the property to open it and show it to new tenants takes substantial time and effort so if there is opportunity to discover ways to minimze the duration, it would be impactful.  I tried to discover this by answering key business questions like 'Which season or quarter of the year is best to list a property?', 
+'Does proximity to a T-Stop impact listing length?', 'Does the state of the economy (e.g. interest rates) play role?
+
+2. Hypothesis
+
+My hypothesis initally was that the quarter of the year a listing goes on the market plays an important role because from past operations, we have generally tried to list in summer months when people are more active and it is less burdensome to move (given cold weather conditions).  Another factor I thought would be critical is the z-score from average listing price.  I did not use the entire dataset when creating this feature - first listings were grouped by season and bedrooms count, then a median price and standard deviation for the group were calculated, and finally the z-score. Finally, I thought interest rates (in my research, as reflected by Freddie Mac primary mortgage market survey on 30 year Fixed Rate Mortgages ) might impact whether an individual decides to rent or buy.  If there are more renters in the market, then this could drive down the days-on-market of a listing.
+
+
+
+3. Data Preparation
+
+Data was sourced using Rentcast API which is a provider of property records across the country. Some very basic data scrubbing work was needed once the api results were written out to xls and then brought back in R (typing date fields as date instead of character, adding back in leading zero's to zipcode field). The min value for listedDate was '2020-02-18' and max '2024-04-12' so a little over four years of listings (7,364 listings in total).  Following fields were built using some basic coding and existing fields in the raw data:
+* closest_t_stop_dist
+* AVG_FRM_30Y
+* listed_quarter
+* large_building_complex
+
+closest_t_stop_dist: Starting with the latitude and longitude of the listings from RentCast, I found the latitutde and longitude of each MBTA T stop going through Arlington/Somerville/Cambridge and then used geosphere library to find the distance of the rental from each.  Finally the min distance value was taken.  Observations are recorded in meters.
+
+AVG_FRM_30Y: Using Freddie Mac primary mortgage market survey on 30 year Fixed Rate Mortgages, I took the weekly data points from the website and grouped by Quarter and Year and took the average.  I then joined to the Rentcast data using the quarter_year field.  Mortgage rates during the timeframe of the data were between 2.789444 (pre and immediate post-pandemic) through 7.279412 (2023 and onwards) so there is quite a large range during the time frame of the dataset. 
+
+listed_quarter:simple transform of listed date using lubridate (Values:1,2,3 or 4)
+
+large_building_complex: I first grouped by addressLine1 (which does not include the unit number, just street address) to see listings that have numerous units listed.  The largest building complex I found had 106 units associated.  I created a new feature large_building_complex to flag any listing that is part of a building with > 10 units.
+
+
+price_z_score: My hunch was that units with a listing price hugely over or hugely under the median listing price for a given quarter_year and bedroom count would have a much longer/shorter days on market.  To gauge this I built the feature price_z_score by first grouping all listings by quarter_year and bedrooms count and finding the median price and standard deviation within those groups.  I then joined that summarized data with the quarter_tear and bedrooms field in the original data set so I could calculate price_z_score using the specific listing price and the associated median price and standard deviation (per the listing's quarter_year and bedrooms count)
+
+```{r echo=FALSE, eval=TRUE}
+
+all_rentcast_data <- list()
+
+for(i in c(1,2,4,5,6,7,8,9)){
+  temp <- read.csv(paste0('C:/Users/ivana/Google Drive (ivana.rocci131@gmail.com)/Harvard_2024/Project/data_file',i,'.csv'))
+  temp2 <- read.csv(paste0('C:/Users/ivana/Google Drive (ivana.rocci131@gmail.com)/Harvard_2024/Project/rentcast_updated_more_history/data_file_history',i,'.csv'))
+  
+  temp_both <- bind_rows(temp,temp2)
+  
+  all_rentcast_data[[i]] <- temp_both
+  
+}
+
+df <- bind_rows(all_rentcast_data)
+
+#Add back in leading zeros since got removed  in file conversion process (from API to csv)
+df$zipCode <- paste0(0,df$zipCode)
+
+#Convert character date fields to proper date type
+df <- df %>%
+     mutate_at(vars(ends_with("Date")), as.Date)
+
+
+#Add year only col
+df$listedYear <- year(df$listedDate)
+
+#Add Quarter col
+df$listedQuarter <- quarter(df$listedDate)
+
+#Add Quarter_Year col
+df$quarter_year <- paste0('Q',df$listedQuarter,' ',df$listedYear)
+
+
+
+
+#Calc distance to all nearby mbta stops
+
+Alewife_latitude <- 42.3964
+Alewife_longitude <-   -71.142 
+Davis_latitude <-42.396        
+Davis_longitude <- -71.1225
+Porter_latitude <- 42.38864
+Porter_longitude <- -71.1194
+Harvard_latitude <-42.37352
+Harvard_longitude <--71.1189
+Central_latitude <- 42.36541
+Central_longitude <- -71.1036
+Kendall_MIT_latitude <- 42.36849              
+Kendall_MIT_longitude <- -71.0902
+
+
+#for each row, calculate distance to mbta stop in meters
+df$dist_to_alewife <- map2_dbl(df$longitude, df$latitude, 
+                               ~distm(c(.x, .y), c(Alewife_longitude, Alewife_latitude)))
+  
+df$dist_to_davis <- map2_dbl(df$longitude, df$latitude, 
+                               ~distm(c(.x, .y), c(Davis_longitude, Davis_latitude)))
+
+df$dist_to_porter <- map2_dbl(df$longitude, df$latitude, 
+                               ~distm(c(.x, .y), c(Porter_longitude, Porter_latitude)))
+
+df$dist_to_harvard <- map2_dbl(df$longitude, df$latitude, 
+                               ~distm(c(.x, .y), c(Harvard_longitude, Harvard_latitude)))
+
+df$dist_to_central <- map2_dbl(df$longitude, df$latitude, 
+                               ~distm(c(.x, .y), c(Central_longitude, Central_latitude)))
+
+df$dist_to_Kendall_MIT <- map2_dbl(df$longitude, df$latitude, 
+                               ~distm(c(.x, .y), c(Kendall_MIT_longitude, Kendall_MIT_latitude)))
+
+df$closest_t_stop_dist <- pmin(df$dist_to_alewife, df$dist_to_davis, df$dist_to_porter, df$dist_to_harvard, df$dist_to_central,  df$dist_to_Kendall_MIT)
+
+
+
+#Bring in FM FRM data from Q1 2020 - Q4 2023
+#Source: https://www.freddiemac.com/pmms
+mortgage_rates <- read.csv('C:/Users/ivana/Google Drive (ivana.rocci131@gmail.com)/Harvard_2024/Project/freddie_mac_AVG_historicalweeklydata.csv')
+
+df <- left_join(df, mortgage_rates, by = 'quarter_year')
+
+#g -- add this is a feature
+large_complex_check <- df %>% group_by(addressLine1) %>% summarize(no_units = n()) #largest has 106 units!
+large_complex_check <- large_complex_check %>% filter(no_units >= 10)
+large_complex_check$large_building_complex <- TRUE
+df <- left_join(df, large_complex_check[,c('addressLine1','large_building_complex')], by = 'addressLine1')
+df$large_building_complex <- ifelse(is.na(df$large_building_complex),'FALSE',df$large_building_complex)
+
+
+```
+
+```{r echo=FALSE, eval=TRUE}
+median_prices_and_sd <- df %>% group_by(quarter_year, bedrooms) %>% summarise(med_price = median(price, na.rm=T), sd = sd(price, na.rm=T))
+df <- left_join(df, median_prices_and_sd, by = c('quarter_year', 'bedrooms'))
+df$price_z_score <- (df$price - df$med_price )/df$sd
+```
+
+Prior to any further analysis, I also reviewed the histograms of the features, as well as dependent variable.  
+
+
+```{r}
+par(mfrow = c(2,4))
+hist(df$bedrooms)
+hist(df$bathrooms)
+hist(df$squareFootage)
+hist(df$price)
+hist(df$closest_t_stop_dist)
+hist(df$AVG_FRM_30Y)
+hist(df$daysOnMarket)
+hist(df$price_z_score)
+
+
+```
+
+This helped alert me of some reasonability filtering that would be beneficial. I did some filtering of the data for fields with large proportion of the values having NA values. This led me to remove lotsize and yearBuilt fields. Additional filtering was done based on following reasonability parameters.  This decreased total row count to 3,884 (from 7,364)
+* remove any listings with a squareFootage >= 9000
+* remove any listings with closest_t_stop_distance >= 40,000 meters (approx 20 miles)
+* remove any listings with a Days on Market > 365
+
+```{r echo=FALSE, eval=TRUE}
+#i Set reasonability params
+df_clean <- df %>% filter(squareFootage < 9000)
+df_clean <- df_clean %>% filter(closest_t_stop_dist < 40000) # (meters, approx 20 miles)
+
+#j
+        qqnorm(df_clean$daysOnMarket)
+        qqline(df_clean$daysOnMarket)
+        boxplot(df_clean$daysOnMarket)
+
+
+
+#k Set reasonability params
+df_clean <- df_clean %>% filter(daysOnMarket < 365)
+
+```
+
+
+
+
+Plot on the right shows the histogram with outlier squarefootage values removed.  A more normal-looking distribution becomes evident.
+```{r}
+par(mfrow = c(1,2))
+hist(df$squareFootage, main = "Distribution of \nSquare Footage")
+hist(df_clean$squareFootage, main = "Distribution of \nSquare Footage")
+
+```
+
+Finally, after completing reasonability filtering, I was left with 3,884rows.  I then inspected the dependent variable, daysOnMarket, by plotting a boxplot, grouped by season/Quarter Listed.  We can quickly see that the median value of Days on Market for Q1 (Jan-March) and Q2(April - June) was below 50 days, while for Q3(July - Sept) and Q4(Oct - Dec) it was slightly above.  Q1 (Jan-March) looks to be much less spread than Q2 (April - June), which had the greatest interquartile range (75th percentile values - 25th percentile).
+
+
+```{r}
+
+boxplot <- df_clean %>% ggplot(aes(x = factor(listedQuarter), y = daysOnMarket)) +
+         geom_boxplot() +
+         xlab("Listed Quarter")+
+         ylab("Days on Market")+
+         ggtitle('Distribution of Days on Market by Listed Quarter')
+
+boxplot
+
+```
+
+
+4. Initial Exploration using Multiple Linear Regression
+
+Once I got comfortable with understanding the raw data and adding the couple additional features, I attempted to fit a model with all the variables which had satisfactory completeness (lotsize and yearBuilt kicked out earlier because of scarcity of actual values). I also further filtered df_clean to only use complete cases (reduced data from 3,884 to 3,662).  Additionally, I ensured all factor variables were correctly typed as factors using str() function.
+From this scrubbed data starting point, I partitioned the data into train and test using 80%/20% split and then fit a linear model and ran a pairs panel to understand multivariate comparisons.  There were a few independent variables with correlations greater than >0.5 (e.g. bathrooms & bedrooms, bathrooms & squarefootage, bedrooms & squarefootage, bedrooms & price, bathrooms & price, squarefootage & price).  This would require closer review by also calculating a VIF value for these variables.
+
+I also ran diagnostic plots to assess if Linear Regression Model- Assumptions could be met.
+
+The assessment of the model, as summarized by R2, adjusted R2 and RMSE is shown below.  RMSE is definitely higher than I'd like if I were to use this model for any predictive purposes.  
+On a positive note, the p-value for the F ratio is extremely low, which points to fact that the overall model does have statistical significance.
+|----------|----------|
+| R2       | 0.28358  | 
+| Adj R2   | 0.2794   |
+| RMSE     | 70.14683 | 
+
+F-statistic: 68.13 on 17 and 2926 DF,  p-value: < 2.2e-16
+
+
+The Significant variables at 0.1% level (p-value < 0.001) from this modeling attempt were:
+* City
+* bedrooms
+* price
+* listedQuarter
+* AVG_FRM_30Y
+* large_building_complex
+* price_z_score
+
+The Significant variables at 1% level (p-value < 0.01) from this modeling attempt were:
+* bathrooms
+
+The Significant variables at 5% level (p-value < 0.05) from this modeling attempt were:
+* squareFootage
+* closest_t_stop_dist 
+
+
+
+```{r echo=FALSE, eval=TRUE}
+df_clean <- df_clean[, c('city','propertyType','bedrooms','bathrooms','squareFootage','price','daysOnMarket','closest_t_stop_dist','listedQuarter','AVG_FRM_30Y', 'large_building_complex', 'price_z_score')]
+
+df_clean <- df_clean %>%
+  mutate(across(c(city, propertyType, listedQuarter, large_building_complex), as.factor))
+
+df_complete <- df_clean[complete.cases(df_clean), ]
+
+str(df_complete)
+
+
+#df_complete <- df_complete %>% filter(bedrooms != 0) #Needed bc when do a log transform, R does not like values that are = 0
+
+set.seed(222)
+ind <- sample(2, nrow(df_complete), replace = T, prob = c(0.8, 0.2))
+train_80 <- df_complete[ind == 1,]
+test_20 <- df_complete[ind == 2,]
+
+
+base.model <- lm(daysOnMarket ~ ., data = train_80)
+summary(base.model)
+# TO DO: Add RMSE in model evaluation
+p <- predict(base.model, train_80) 
+plot(train_80$daysOnMarket,p)
+#calc RMSE (matches slide for train)
+sqrt(mean((train_80$daysOnMarket-p)^2))
+#Rsquared
+(cor(train_80$daysOnMarket,p))^2
+
+
+#Days on Market looks to be right-skewed. 
+chart.Correlation(train_80[,c('bedrooms', 'bathrooms','squareFootage',  'price','closest_t_stop_dist','AVG_FRM_30Y','daysOnMarket')]) 
+# pairs.panels(train_80)
+
+# Does the model satisfy the assumptions of MLR?
+par(mfrow = c(2,2))
+plot(base.model)
+
+```
+
+4a) Assessment of Linearity and Homoscedasticity Assumptions:
+a) Linearity/Independence (Residuals v Fitted)
+The plot of Residuals vs Fitted values looks for homoscedasticity(which is the assumption that the variance of the errors is constant across all levels of the independent variables) as well as linearity and it shows a funneling pattern with non-randomn clustering around the dotted line.  The red line shown in the plot would ideally be flat.
+With that, it violates the assumption because it does NOT show random pattern.
+Action ==> consider applying a log transformation to the independent and dependent variables
+
+b) Normality (Normal Q-Q Plot)
+The standardized residuals fits the qqline generally. However, there are sever deviations  when standardized residuals become greater than 1. We can conclude that the residuals do NOT show a normal distribution.
+ Action ==> consider applying a non-linear transformation to the independent and dependent variables 
+ 
+c) Equality of Variance (Scale-Location Plot)
+The standardized residuals shows that they are creating an upward sloping trend rather than being equally and randomly distributed.
+Hence, the graph does NOT show that it satisfies the assumption of homoscedasticity or equality of variance.
+
+d) High leverage points (Cook's Diance , Residuals vs Leverage)
+The graph shows that there are no residuals near or outside the Cook's distance (0.5 or 1). This is positive to see there are no outliers or high leverage points that are potentially over-influencing the linear model. It is overall positive to see most of the points clustered towards the left, indicating there are not any high leverage points which are overly influencing the model.
+
+CHECK FOR MULTICOLLINEARITY:
+```{r,eval=TRUE}
+ vif(base.model)
+```
+Multicollinarity is not present since all the variables have a VIF < 10
+
+
+
+4b) Transformations attempted so can meet assumptions of Multiple Linear Refression.  First I completed a Box-Cox transformation check to check if a log-transform would be a reasonable next step.  The peak of the plot is close to lambda = zero, then can try doing log transform.  Reviewing the pairs panels from earlier, it seems most of the variables have a skewed distribution (majority right, but some left like AVG_FRM_30Y).   I tried numerous combinations of variables for each to perform the log transformation but in the end, landed on squareFootage and price since these have the greatest spread and were susceptible to a right skew.  Reviewing the pair-wise correlation plots following the transforms did seem to yield improvements in the skewness of squareFootage and price, however the problem of 
+
+Residuals vs Fitted plot and the Scale-Location plot still shown some funneling.  Additionally, there is little improvement in the Q-Q plot.
+
+
+```{r}
+par(mfrow = c(1,1))
+bc <- boxcox(base.model, data = df_complete)
+
+```
+
+
+
+```{r}
+
+#df_complete$log_daysOnMarket <- log(df_complete$daysOnMarket)
+#df_complete$log_bedrooms <- log(df_complete$bedrooms)
+#df_complete$log_bathrooms <- log(df_complete$bathrooms)
+df_complete$log_squareFootage <- log(df_complete$squareFootage)
+df_complete$log_price <- log(df_complete$price)
+#df_complete$log_closest_t_stop_dist <- log(df_complete$closest_t_stop_dist)
+#df_complete$log_AVG_FRM_30Y <- log(df_complete$AVG_FRM_30Y)
+
+ind <- sample(2, nrow(df_complete), replace = T, prob = c(0.8, 0.2))
+train_80 <- df_complete[ind == 1,]
+test_20 <- df_complete[ind == 2,]
+
+
+base.model_2 <- lm(daysOnMarket ~ city +  propertyType + bedrooms + bathrooms + log_squareFootage +  log_price + closest_t_stop_dist + listedQuarter +  AVG_FRM_30Y + large_building_complex, data = train_80)
+summary(base.model_2)
+
+chart.Correlation(train_80[,c('bedrooms', 'bathrooms','log_squareFootage',  'log_price','closest_t_stop_dist','AVG_FRM_30Y','daysOnMarket')]) 
+
+#Try with fewer independent vars.  Remove the independent vars which are highly correlated with price (bedrooms and bathrooms)
+chart.Correlation(train_80[,c('squareFootage',  'price','closest_t_stop_dist','AVG_FRM_30Y','daysOnMarket')]) 
+
+
+# Does the model satisfy the assumptions of MLR?
+par(mfrow = c(2,2))
+plot(base.model_2)
+
+```
+
+
+
+
+
+4c) A check for Interaction variables was also considered since it could be useful in adding additional explanatory power to the model.  I did not use all possible interactions but only the variables whose impact on Days on Market could logically depend on the value of another variable.  I tried to identify those by reviewing below plots and looking for variables whose lines did cross and there was a reasonable explanation/plausibility of interaction effect being present.
+
+After running the new model, all the interaction effect variables did show signifcance at  either 0.1% level (p-value < 0.001) or 1% level (p-value < 0.01) level which indicates the selected variables impact on Days on Market could be dependent on the level or value of another variable.  Interestingly, the R squared value decreased (0.2391), so the goal of increasing the explanatory power of the model was not achieved.
+
+
+```{r}
+base.model_3 <- lm(daysOnMarket ~ city +  propertyType + squareFootage + price +  listedQuarter +  AVG_FRM_30Y + large_building_complex + price_z_score + squareFootage*propertyType +  price*propertyType + listedQuarter*squareFootage + listedQuarter*price, data = train_80)
+summary(base.model_3)
+plot(base.model_3)
+```
+
+
+5.) An alternative approach was to investigate using a non-parametric method since it is does not require meeting assumptions of linearity, normality and homoscedascity as a linear approach requires.  I started with a single regression tree, then bagging and two variations of randomn forest methods.
+
+```{r}
+# Do not use log transform variables
+df_complete <- df_complete[, c('city','propertyType','bedrooms','bathrooms','squareFootage','price','daysOnMarket','closest_t_stop_dist','listedQuarter','AVG_FRM_30Y', 'large_building_complex', 'price_z_score')]
+
+ind <- sample(2, nrow(df_complete), replace = T, prob = c(0.8, 0.2))
+train_80 <- df_complete[ind == 1,]
+test_20 <- df_complete[ind == 2,]
+
+
+# regression tree
+tree <- rpart(daysOnMarket ~ ., data = train_80)
+rpart.plot(tree)
+printcp(tree)
+plotcp(tree)
+
+# Predict 
+p <- predict(tree, test_20)
+plot(p ~ test_20$daysOnMarket)
+#calc RMSE (matches slide for train)
+sqrt(mean((test_20$daysOnMarket-p)^2))
+#Rsquared
+(cor(test_20$daysOnMarket,p))^2
+
+# Bagging
+# cvcontrol is a list that specifies the settings for 2-times repeated 5-fold cross-validation with parallel computation.
+set.seed(1234)
+cvcontrol <- trainControl(method="repeatedcv", 
+                          number = 5,
+                          repeats = 2,
+                          allowParallel=TRUE)
+#method = "repeatedcv": This sets the resampling method to repeated k-fold cross-validation.
+#number = 5.  In each repetition of the cross-validation process, data split into 5 subsets (folds). The model is trained on 4 of these subsets and tested on the remaining subset
+#repeats = 2.  Number of repetitions in the repeated k-fold cross-validation. That is, the whole process of 5-fold cross-validation is repeated 2 times.
+
+
+set.seed(1234)
+model_bag <- train(daysOnMarket  ~  ., 
+             data=train_80,
+             method="treebag",##BAGGING METHOD
+             trControl=cvcontrol,
+             importance=TRUE) ##VAR IMPORTANCE INCLUDE
+plot(varImp(model_bag))
+model_bag
+
+
+# Plot, RMSE, R-square
+ba <- predict(model_bag,  test_20)
+plot(ba ~ test_20$daysOnMarket, main = 'Predicted Vs Actual DaysonMarket - Test data')
+sqrt(mean((test_20$daysOnMarket - ba)^2)) #RSME
+cor(test_20$daysOnMarket, ba) ^2  #R-squared
+
+
+
+# RF
+set.seed(1234)
+cvcontrol <- trainControl(method="repeatedcv", 
+                          number = 5,
+                          repeats = 2,
+                          allowParallel=TRUE)
+
+
+forest <- train(daysOnMarket  ~  ., 
+             data=train_80,
+             method="rf",  #ONLY DIFF
+             trControl=cvcontrol,
+             importance=TRUE)
+plot(varImp(forest))
+forest
+
+# Plot, RMSE, R-square
+rf <-  predict(forest,  test_20)
+plot(rf ~ test_20$daysOnMarket, main = 'Predicted Vs Actual DaysonMarket - Test data')
+sqrt(mean((test_20$daysOnMarket - rf)^2))
+cor(test_20$daysOnMarket, rf) ^2
+
+
+# Extract the RMSE values and the corresponding numbers of predictors
+# PROF RAI:  How is it even coming up with a mtry = 18?? Because I only have 12 predictor vars
+results <- forest$results[, c("mtry", "RMSE")]
+
+# Plot RMSE versus number of predictors
+ggplot(results, aes(x = mtry, y = RMSE)) +
+  geom_point() +
+  geom_line() +
+  labs(x = "Number of Predictors", y = "RMSE")+
+  ggtitle("RMSE vs Number of Predictors in Random Forest")
+
+
+
+### Visualize variable importance ----------------------------------------------
+# https://hackernoon.com/random-forest-regression-in-r-code-and-interpretation
+# Get variable importance from the model fit
+# Assume `model` is your Random Forest model trained with caret
+rf_final_model <- forest$finalModel
+
+# Get variable importance
+importance_df <- as.data.frame(randomForest::importance(rf_final_model))
+var_names <- row.names(importance_df)
+importance_df$var_names <- var_names
+
+# Reorder the factor levels of var_names in descending order of %IncMSE
+importance_df$var_names <- reorder(importance_df$var_names, importance_df$`%IncMSE`)
+
+ggplot(importance_df, aes(x=var_names, y=`%IncMSE`)) +
+  geom_segment( aes(x=var_names, xend=var_names, y=0, yend=`%IncMSE`), color="skyblue") +
+  geom_point(aes(size = IncNodePurity), color="blue", alpha=0.6) +
+  theme_light() +
+  coord_flip() +
+  xlab("") +  # Remove y-axis label
+  theme(
+    legend.position="bottom",
+    panel.grid.major.y = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+#MSE is based on permuting out-of-bag sections of the data per individual tree and predictor, and the errors are then averaged. 
+#In the regression context, Node purity is the total decrease in residual sum of squares when splitting on a variable averaged over all trees (i.e. how well a predictor decreases variance). 
+#MSE is a more reliable measure of variable importance. If the two importance metrics show different results, listen to MSE
+
+
+# Explain predictions for first 3 rows in test data
+# 
+
+explainer <- lime(test_20[1:3,], forest, n_bins = 5)
+explanation <- explain( x = test_20[1:3,], 
+                       explainer = explainer, 
+                       n_features = 5) # n features allows you to see top 5 features
+plot_features(explanation)
+
+```
+
+```{r eval=FALSE}
+# RF ALT
+#when running train() using caret package how do experiment with number of trees (ntree) or the number of variables tried at each split (mtry)?
+# Assume `df` is your data frame and `outcome` is your outcome variable
+# Set up the control function for training
+set.seed(1234)
+cvcontrol <- trainControl(method="repeatedcv", 
+                          number = 5,
+                          repeats = 2,
+                          allowParallel=TRUE)
+
+# Define the tuning grid
+tune_grid <- expand.grid(.mtry = c(1, 2, 3), .ntree = c(100, 200, 300))
+
+# Train the model with different values of mtry and ntree
+forest2 <- train(daysOnMarket  ~  ., 
+             data=train_80,
+             method="rf",  #ONLY DIFF
+             trControl=cvcontrol,
+             tuneGrid = tune_grid,
+             importance=TRUE)
+forest2
+
+```
+
+5. Results and Conclusions
+
+
+6. Challenges and Limitations
+further analysis:
+
+repeat listings
+listings using property manager
+
+
+7. References
+[1] Freddie Mac Primary Mortgage Market Survey https://www.freddiemac.com/pmms
+
+[2] "435: Is It Better to Rent or Buy a House?", 7 June 2023,  https://moneyfortherestofus.com/435-rent-or-buy-a-house/
+
+[3] "Random Forest Regression in R: Code and Interpretation", 
+28 Dec 2021 https://hackernoon.com/random-forest-regression-in-r-code-and-interpretation
+
+[4] "Visualizing Interaction Effects with ggplot2", January 17, 2017, https://sebastiansauer.github.io/vis_interaction_effects/
+
+
+
+8. Appendix
+
+
+
+
